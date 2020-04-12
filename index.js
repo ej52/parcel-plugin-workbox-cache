@@ -24,7 +24,7 @@ module.exports = bundler => {
       logger.success(`Generated sw.js, which will precache ${count} files.`)
 
       const index = path.resolve(bundler.options.outDir, 'index.html')
-      const data = readFileSync(index, 'utf8')
+      let data = readFileSync(index, 'utf8')
 
       if (!data.includes('serviceWorker.register')) {
         data = data.replace('</body>', swTag + '</body>')
