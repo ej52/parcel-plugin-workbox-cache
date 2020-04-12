@@ -1,104 +1,38 @@
-const { generateSWString } = require('workbox-build')
-const Terser = require( 'terser' )
-
-const { readFile, writeFileSync } = require('fs')
-const logger = require('@parcel/logger')
+const { injectManifest } = require('workbox-build')
+const { readFileSync, writeFileSync } = require('fs')
 const path = require('path')
+const logger = require('@parcel/logger')
 
-function transform(code, minify) {
-  if (!minify) {
-    return code
-  }
+const swTag = `<script>if ('serviceWorker' in navigator) window.addEventListener('load', function() {navigator.serviceWorker.register('/sw.js')})</script>`
 
-  const minified = Terser.minify(code)
-  if (minified.error) {
-    throw Error(minified.error)
-  }
-
-  return minified.code
-}
-
-module.exports = bundle => {
-  bundle.on('buildEnd', async () => {
-    const dest = path.resolve(bundle.options.outDir)
-    // Get parcel asset
-    const mainAsset =
-      bundle.mainAsset ||
-      bundle.mainBundle.entryAsset ||
-      bundle.mainBundle.childBundles.values().next().value.entryAsset
-    // Get config else use default
-    const config = Object.assign({
-      importScripts: ['./worker.js'],
-      globDirectory: bundle.options.outDir,
-      globPatterns: [`**/*.{css,html,js,gif,ico,jpg,png,svg,webp,woff,woff2,ttf,otf}`]
-    }, (await mainAsset.getConfig(['.workbox-config.js', 'workbox-config.js'], { packageKey: 'workbox' })) || {})
-
-    const noInject = config.noInject || false;
-    delete config.noInject;
-
+module.exports = bundler => {
+  bundler.on('buildEnd', async () => {
     logger.log('🛠️  Workbox')
-    // Copy importScripts
-    const scripts = config.importScripts.map(async script => {
-      readFile(index, 'utf8', (error, data) => {
-        if (error) {
-          logger.error(error)
-          return
-        }
 
-        const file = /[^\/]+$/.exec(script)[0]
-        const dest = path.join(dest, file)
-
-        writeFileSync(dest, transform(data, bundle.options.minify))
-        logger.success(`Imported ${script} to ${dest}`)
-
-        return file
-      })
-      
+    let config = Object.assign({
+      globDirectory: path.resolve(bundler.options.outDir),
+      globPatterns: [`**/*.{css,html,js,gif,ico,jpg,png,svg,webp,woff,woff2,ttf,otf}`]
+    }, (await bundler.mainBundle.entryAsset.getConfig(
+      [".workbox-config.js", "workbox-config.js"],
+      { packageKey: "workbox" }
+    )) || {}, {
+      swDest: path.resolve(bundler.options.outDir, 'sw.js')
     })
-    // Generate service worker
-    const swString = await generateSWString({
-      ...config,
-      importScripts: [
-        'https://storage.googleapis.com/workbox-cdn/releases/5.1.2/workbox-sw.js',
-        ...scripts
-      ]
-    }).catch(error => logger.error(error));
-    logger.success('Service worker generated');
-    // Write service worker file
-    writeFileSync(path.join(dest, 'sw.js'), transform(swString, bundle.options.minify))
-    logger.success(`Service worker written to ${dest}/sw.js`)
-    // Inject the service worker registration
-    if (!noInject) {
-      const index = path.join(dest, 'index.html')
-      readFile(index, 'utf8', (error, data) => {
-        if (error) {
-          logger.error(error)
-          return
-        }
 
-        let registration = `
-        if ('serviceWorker' in navigator) {
-          window.addEventListener('load', function() {
-            navigator.serviceWorker.register('/sw.js');
-          });
-        }
-        `
+    try {
+      const { count } = await injectManifest(config)
+      logger.success(`Generated sw.js, which will precache ${count} files.`)
 
-        if (bundle.options.minify) {
-          registration = `<script>${transform(registration, true)}</script></body>`
-        } else {
-          registration = `
-            <script>
-            ${registration}
-            </script>
-          </body>
-          `
-        }
+      const index = path.resolve(bundler.options.outDir, 'index.html')
+      const data = readFileSync(index, 'utf8')
 
-        data = data.replace('</body>', registration)
+      if (!data.includes('serviceWorker.register')) {
+        data = data.replace('</body>', swTag + '</body>')
         writeFileSync(index, data)
-        logger.success(`Service worker injected into ${dest}/index.html`)
-      });
+        logger.success(`Service worker injected into index.html.`)
+      }
+    } catch (error) {
+      logger.error(error.message)
     }
   })
 }
