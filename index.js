@@ -1,111 +1,104 @@
 const { generateSWString } = require('workbox-build')
+const Terser = require( 'terser' )
+
 const { readFile, writeFileSync } = require('fs')
 const logger = require('@parcel/logger')
 const path = require('path')
-const uglifyJS = require( 'uglify-js' )
-const workboxConfig = require( '../../.workbox-config.js' )
+
+function transform(code, minify) {
+  if (!minify) {
+    return code
+  }
+
+  const minified = Terser.minify(code)
+  if (minified.error) {
+    throw Error(minified.error)
+  }
+
+  return minified.code
+}
 
 module.exports = bundle => {
   bundle.on('buildEnd', async () => {
-    // output path
-    let pathOut = bundle.options.outDir
-    const fileFormats = 'css,html,js,gif,ico,jpg,png,svg,webp,woff,woff2,ttf,otf'
-    const DEFAULT_CONFIG = {
-      // scripts to import into sw
-      importScripts: ['./worker.js'],
-      // directory to include
-      globDirectory: bundle.options.outDir,
-      // file types to include
-      globPatterns: [`**/*.{${fileFormats}}`]
-    }
-
-    let pkg
-    let mainAsset =
+    const dest = path.resolve(bundle.options.outDir)
+    // Get parcel asset
+    const mainAsset =
       bundle.mainAsset ||
       bundle.mainBundle.entryAsset ||
       bundle.mainBundle.childBundles.values().next().value.entryAsset
+    // Get config else use default
+    const config = Object.assign({
+      importScripts: ['./worker.js'],
+      globDirectory: bundle.options.outDir,
+      globPatterns: [`**/*.{css,html,js,gif,ico,jpg,png,svg,webp,woff,woff2,ttf,otf}`]
+    }, (await mainAsset.getConfig(['.workbox-config.js', 'workbox-config.js'], { packageKey: 'workbox' })) || {})
 
-    pkg = typeof mainAsset.getPackage === 'function' ? await mainAsset.getPackage() : mainAsset.package
-    
-    let config = Object.assign({}, workboxConfig ? workboxConfig : DEFAULT_CONFIG)
-    
-    if (pkg.workbox) {
-      if (pkg.workbox.importScripts && Array.isArray(pkg.workbox.importScripts)) {
-        config.importScripts = pkg.workbox.importScripts
-      }
-      if (pkg.workbox.importScripts && !Array.isArray(pkg.workbox.importScripts)) {
-        config.importScripts = [pkg.workbox.importScripts]
-      }
-      if (pkg.workbox.globDirectory) config.globDirectory = pkg.workbox.globDirectory
-      config.globDirectory = path.resolve(config.globDirectory)
-      if (pkg.workbox.globPatterns && Array.isArray(pkg.workbox.globPatterns)) {
-        config.globPatterns = pkg.workbox.globPatterns
-      }
-      if (pkg.workbox.globPatterns && !Array.isArray(pkg.workbox.globPatterns)) {
-        config.globPatterns = [pkg.workbox.globPatterns]
-      }
-      if (pkg.workbox.pathOut) pathOut = pkg.workbox.pathOut
-    }
-    const dest = path.resolve(pathOut)
+    const noInject = config.noInject || false;
+    delete config.noInject;
 
     logger.log('🛠️  Workbox')
-    config.importScripts.forEach(s => {
-      readFile(path.resolve(s), (err, data) => {
-        if (err) throw err
-        if (bundle.options.minify) {
-          data = uglifyJS.minify(data).code
+    // Copy importScripts
+    const scripts = config.importScripts.map(async script => {
+      readFile(index, 'utf8', (error, data) => {
+        if (error) {
+          logger.error(error)
+          return
         }
-        const impDest = path.resolve(pathOut, /[^\/]+$/.exec(s)[0])
-        writeFileSync(impDest, data)
-        logger.success(`Imported ${s} to ${impDest}`)
+
+        const file = /[^\/]+$/.exec(script)[0]
+        const dest = path.join(dest, file)
+
+        writeFileSync(dest, transform(data, bundle.options.minify))
+        logger.success(`Imported ${script} to ${dest}`)
+
+        return file
       })
+      
     })
-
-    config.importScripts = config.importScripts.map(s => {
-      return /[^\/]+$/.exec(s)[0]
-    })
-    config.importScripts.unshift('https://storage.googleapis.com/workbox-cdn/releases/4.3.1/workbox-sw.js')
-
-    generateSWString(config)
-      .then(swString => {
-        swString = swString.swString
-        logger.success('Service worker generated')
-        if (bundle.options.minify) {
-          swString = uglifyJS.minify(swString).code
-          logger.success('Service worker minified')
+    // Generate service worker
+    const swString = await generateSWString({
+      ...config,
+      importScripts: [
+        'https://storage.googleapis.com/workbox-cdn/releases/5.1.2/workbox-sw.js',
+        ...scripts
+      ]
+    }).catch(error => logger.error(error));
+    logger.success('Service worker generated');
+    // Write service worker file
+    writeFileSync(path.join(dest, 'sw.js'), transform(swString, bundle.options.minify))
+    logger.success(`Service worker written to ${dest}/sw.js`)
+    // Inject the service worker registration
+    if (!noInject) {
+      const index = path.join(dest, 'index.html')
+      readFile(index, 'utf8', (error, data) => {
+        if (error) {
+          logger.error(error)
+          return
         }
-        writeFileSync(path.join(dest, 'sw.js'), swString)
-        logger.success(`Service worker written to ${dest}/sw.js`)
-      })
-      .catch(err => {
-        logger.error(err)
-      })
 
-    const entry = path.resolve(pathOut, 'index.html')
-    readFile(entry, 'utf8', (err, data) => {
-      if (err) logger.error(err)
-      if (!data.includes('serviceWorker.register')) {
-        let swTag = `
+        let registration = `
         if ('serviceWorker' in navigator) {
           window.addEventListener('load', function() {
             navigator.serviceWorker.register('/sw.js');
           });
         }
-      `
+        `
+
         if (bundle.options.minify) {
-          swTag = uglifyJS.minify(swTag)
-          swTag = `<script>${swTag.code}</script></body>`
+          registration = `<script>${transform(registration, true)}</script></body>`
         } else {
-          swTag = `
-        <script>
-        ${swTag}
-        </script>
-      </body>`
+          registration = `
+            <script>
+            ${registration}
+            </script>
+          </body>
+          `
         }
-        data = data.replace('</body>', swTag)
-        writeFileSync(entry, data)
+
+        data = data.replace('</body>', registration)
+        writeFileSync(index, data)
         logger.success(`Service worker injected into ${dest}/index.html`)
-      }
-    })
+      });
+    }
   })
 }
